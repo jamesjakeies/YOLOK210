@@ -1,78 +1,111 @@
-# -*- coding: utf-8 -*-
-
+"""
+Retrain the YOLO model for your own dataset.
+"""
 import numpy as np
-np.random.seed(111)
-import argparse
+import keras.backend as K
+from keras.layers import Input, Lambda
+from keras.models import Model
+from keras.callbacks import TensorBoard, ModelCheckpoint, EarlyStopping
+
+from yolo3.model import preprocess_true_boxes, yolo_body, tiny_yolo_body, yolo_loss
+from yolo3.utils import get_random_data
+
 import os
-import json
-from yolo.frontend import create_yolo, get_object_labels
-
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
+def _main():
+    annotation_path = '2007_train.txt'
+    log_dir = 'logs/000/'
+    classes_path = 'model_data/voc_classes.txt'
+    anchors_path = 'model_data/yolo_anchors.txt'
+    class_names = get_classes(classes_path)
+    anchors = get_anchors(anchors_path)
+    input_shape = (416,416) # multiple of 32, hw
+    model = create_model(input_shape, anchors, len(class_names) )
+    train(model, annotation_path, input_shape, anchors, len(class_names), log_dir=log_dir)
 
-argparser = argparse.ArgumentParser(
-    description='Train and validate YOLO_v2 model on any dataset')
+def train(model, annotation_path, input_shape, anchors, num_classes, log_dir='logs/'):
+    model.compile(optimizer='adam', loss={
+        'yolo_loss': lambda y_true, y_pred: y_pred})
+    logging = TensorBoard(log_dir=log_dir)
+    checkpoint = ModelCheckpoint(log_dir + "ep{epoch:03d}-loss{loss:.3f}-val_loss{val_loss:.3f}.h5",
+        monitor='val_loss', save_weights_only=True, save_best_only=True, period=1)
+    batch_size = 3
+    val_split = 0.1
+    with open(annotation_path) as f:
+        lines = f.readlines()
+    np.random.shuffle(lines)
+    num_val = int(len(lines)*val_split)
+    num_train = len(lines) - num_val
+    print('Train on {} samples, val on {} samples, with batch size {}.'.format(num_train, num_val, batch_size))
 
-argparser.add_argument(
-    '-c',
-    '--conf',
-    default="configs/from_scratch.json",
-    help='path to configuration file')
+    model.fit_generator(data_generator_wrap(lines[:num_train], batch_size, input_shape, anchors, num_classes),
+            steps_per_epoch=max(1, num_train//batch_size),
+            validation_data=data_generator_wrap(lines[num_train:], batch_size, input_shape, anchors, num_classes),
+            validation_steps=max(1, num_val//batch_size),
+            epochs=200,
+            initial_epoch=0)
+    model.save_weights(log_dir + 'trained_weights.h5')
 
-def setup_training(config_file):
-    """make directory to save weights & its configuration """
-    import shutil
-    with open(config_file) as config_buffer:
-        config = json.loads(config_buffer.read())
-    dirname = config['train']['saved_folder']
-    if os.path.isdir(dirname):
-        print("{} is already exists. Weight file in directory will be overwritten".format(dirname))
-    else:
-        print("{} is created.".format(dirname, dirname))
-        os.makedirs(dirname)
-    print("Weight file and Config file will be saved in \"{}\"".format(dirname))
-    shutil.copyfile(config_file, os.path.join(dirname, "config.json"))
-    return config, os.path.join(dirname, "weights.h5")
+def get_classes(classes_path):
+    with open(classes_path) as f:
+        class_names = f.readlines()
+    class_names = [c.strip() for c in class_names]
+    return class_names
 
+def get_anchors(anchors_path):
+    with open(anchors_path) as f:
+        anchors = f.readline()
+    anchors = [float(x) for x in anchors.split(',')]
+    return np.array(anchors).reshape(-1, 2)
+
+def create_model(input_shape, anchors, num_classes, load_pretrained=False, freeze_body=False,
+            weights_path='model_data/yolo.h5'):
+    K.clear_session() # get a new session
+    image_input = Input(shape=(None, None, 3))
+    h, w = input_shape
+    num_anchors = len(anchors)
+    y_true = [Input(shape=(h//{0:32, 1:16, 2:8}[l], w//{0:32, 1:16, 2:8}[l], \
+        num_anchors//3, num_classes+5)) for l in range(3)]
+
+    model_body = yolo_body(image_input, num_anchors//3, num_classes)
+    print('Create YOLOv3 model with {} anchors and {} classes.'.format(num_anchors, num_classes))
+
+    if load_pretrained:
+        model_body.load_weights(weights_path, by_name=True, skip_mismatch=True)
+        print('Load weights {}.'.format(weights_path))
+        if freeze_body:
+            # Do not freeze 3 output layers.
+            num = len(model_body.layers)-7
+            for i in range(num): model_body.layers[i].trainable = False
+            print('Freeze the first {} layers of total {} layers.'.format(num, len(model_body.layers)))
+
+    model_loss = Lambda(yolo_loss, output_shape=(1,), name='yolo_loss',
+        arguments={'anchors': anchors, 'num_classes': num_classes, 'ignore_thresh': 0.5})(
+        [*model_body.output, *y_true])
+    model = Model([model_body.input, *y_true], model_loss)
+    return model
+def data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes):
+    n = len(annotation_lines)
+    np.random.shuffle(annotation_lines)
+    i = 0
+    while True:
+        image_data = []
+        box_data = []
+        for b in range(batch_size):
+            i %= n
+            image, box = get_random_data(annotation_lines[i], input_shape, random=True)
+            image_data.append(image)
+            box_data.append(box)
+            i += 1
+        image_data = np.array(image_data)
+        box_data = np.array(box_data)
+        y_true = preprocess_true_boxes(box_data, input_shape, anchors, num_classes)
+        yield [image_data, *y_true], np.zeros(batch_size)
+
+def data_generator_wrap(annotation_lines, batch_size, input_shape, anchors, num_classes):
+    n = len(annotation_lines)
+    if n==0 or batch_size<=0: return None
+    return data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes)
 
 if __name__ == '__main__':
-    args = argparser.parse_args()
-    config, weight_file = setup_training(args.conf)
-    
-    if config['train']['is_only_detect']:
-        labels = ["object"]
-    else:
-        if config['model']['labels']:
-            labels = config['model']['labels']
-        else:
-            labels = get_object_labels(config['train']['train_annot_folder'])
-    print(labels)
-
-    # 1. Construct the model 
-    yolo = create_yolo(config['model']['architecture'],
-                       labels,
-                       config['model']['input_size'],
-                       config['model']['anchors'],
-                       config['model']['coord_scale'],
-                       config['model']['class_scale'],
-                       config['model']['object_scale'],
-                       config['model']['no_object_scale'])
-    
-    # 2. Load the pretrained weights (if any) 
-    yolo.load_weights(config['pretrained']['full'], by_name=True)
-
-    # 3. actual training 
-    yolo.train(config['train']['train_image_folder'],
-               config['train']['train_annot_folder'],
-               config['train']['actual_epoch'],
-               weight_file,
-               config["train"]["batch_size"],
-               config["train"]["jitter"],
-               config['train']['learning_rate'], 
-               config['train']['train_times'],
-               config['train']['valid_times'],
-               config['train']['valid_image_folder'],
-               config['train']['valid_annot_folder'],
-               config['train']['first_trainable_layer'],
-               config['train']['is_only_detect'])
-    # loss: 2.1691, train batch jitter=False
+    _main()
